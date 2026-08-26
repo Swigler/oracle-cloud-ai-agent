@@ -1,8 +1,8 @@
-# Oracle Free Tier AI Agent
+# Oracle Cloud AI Agent
 
-> Voice AI assistant on Oracle Cloud Free Tier. Zero infrastructure cost. One script to deploy.
+> Voice AI assistant on Oracle Cloud. Cost-optimized infrastructure. One script to deploy.
 
-A self-hosted AI voice assistant that runs on Oracle's always-free VM. Talk to it via Telegram -- voice or text in, voice + text out. The client brings an Oracle account and an LLM API key; everything else is free and offline.
+A self-hosted AI voice assistant that runs on Oracle's always-on VM. Talk to it via Telegram -- voice or text in, voice + text out. The client brings an Oracle account and an LLM API key; everything else runs locally and offline.
 
 ## Architecture
 
@@ -28,9 +28,9 @@ Both bots use outbound long-polling only -- **no inbound ports, no webhook, no T
 
 | What | Cost | Purpose |
 |---|---|---|
-| Oracle Cloud account | Free | The VM -- card for identity check, never billed |
+| Oracle Cloud account | $0 | The VM -- card for identity check, never billed |
 | DeepSeek API key | ~$0.14/M tokens | The LLM brain |
-| 2 Telegram bot tokens | Free | Agent bot + Ops bot (via @BotFather) |
+| 2 Telegram bot tokens | $0 | Agent bot + Ops bot (via @BotFather) |
 
 That's the whole list. No GPU, no RunPod, no monthly hosting bill.
 
@@ -39,13 +39,13 @@ That's the whole list. No GPU, no RunPod, no monthly hosting bill.
 SSH into a fresh Ubuntu 22.04/24.04 `VM.Standard.E2.1.Micro` and run:
 
 ```bash
-curl -O https://raw.githubusercontent.com/Swigler/oracle-free-tier-ai-agent/main/install.sh
+curl -O https://raw.githubusercontent.com/Swigler/oracle-cloud-ai-agent/main/install.sh
 bash install.sh
 ```
 
 The script will:
 1. Create 2 GB swap (1 GB RAM can't run `apt` + `npm` without it)
-2. Purge bloatware (`snapd`, `fwupd`) -- frees ~100 MB on a 1 GB box
+2. Purge bloatware (`snapd`, `fwupd`) -- reclaims ~100 MB on a 1 GB box
 3. Harden SSH (key-only, no root, kill `rpcbind`)
 4. Install Node.js 22, OpenClaude, uv, Python dependencies
 5. Download English STT + TTS models
@@ -100,11 +100,11 @@ This is a Fiverr/Upwork gig:
 
 | Tier | Price | What |
 |---|---|---|
-| Self-serve | Free | Client follows the guide, runs the script themselves |
+| Self-serve | $0 | Client follows the guide, runs the script themselves |
 | Done-for-you | $50 | We SSH in and set it up |
 | Managed | $50 + $5-10/mo | Setup + monitoring (keepalive, auto-restart, health alerts) |
 
-The client's only recurring cost is LLM tokens. Everything else runs forever on their free Oracle account.
+The client's only recurring cost is LLM tokens. Everything else runs indefinitely on their Oracle Cloud account.
 
 ## Built With
 
