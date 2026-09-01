@@ -6,6 +6,8 @@ import subprocess
 import tempfile
 import wave
 import logging
+import json
+import threading
 import numpy as np
 from pathlib import Path
 
@@ -26,6 +28,48 @@ VENV_PYTHON = Path(__file__).parent / '.venv' / 'bin' / 'python'
 MODEL_DIR = Path.home() / 'models'
 STT_DIR = MODEL_DIR / 'sherpa-onnx-streaming-zipformer-en-2023-06-26'
 TTS_MODEL = MODEL_DIR / 'piper' / 'en_GB-cori-medium.onnx'
+
+# --- memory hook ---
+import urllib.request
+import urllib.error
+
+MEMORY_API_URL = 'http://localhost:3100'
+_msg_counts = {}  # user_id -> int
+_transcripts = {}  # user_id -> list of {"role": ..., "content": ...}
+CONSOLIDATE_EVERY = 30
+
+
+def _memory_log(user_id, role, text):
+    uid = str(user_id)
+    if uid not in _transcripts:
+        _transcripts[uid] = []
+    _transcripts[uid].append({"role": role, "content": text[:500]})
+    _msg_counts[uid] = _msg_counts.get(uid, 0) + 1
+
+
+def _memory_should_consolidate(user_id):
+    return _msg_counts.get(str(user_id), 0) % CONSOLIDATE_EVERY == 0
+
+
+def _memory_consolidate(user_id):
+    uid = str(user_id)
+    transcript = _transcripts.get(uid, [])
+    if not transcript:
+        return
+    payload = json.dumps({"userId": uid, "transcript": transcript}).encode()
+    req = urllib.request.Request(
+        f"{MEMORY_API_URL}/v1/consolidate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=120)
+        log.info(f"[memory] consolidated {len(transcript)} messages for {uid}")
+    except Exception as e:
+        log.warning(f"[memory] consolidation failed: {e}")
+    _transcripts[uid] = []
+
 
 # --- lazy-loaded singletons ---
 _recognizer = None
@@ -62,40 +106,32 @@ def gate(user_id: int) -> bool:
 
 
 def transcribe(audio_path: str) -> str:
-    """Convert audio file to text via sherpa-onnx."""
-    # Convert to wav first
     wav_path = audio_path + '.wav'
     subprocess.run(
         ['ffmpeg', '-y', '-i', audio_path, '-ar', '16000', '-ac', '1', '-f', 'wav', wav_path],
         capture_output=True, check=True,
     )
-
     recognizer = get_recognizer()
     with wave.open(wav_path) as f:
         sample_rate = f.getframerate()
         samples = f.readframes(f.getnframes())
-
     samples = np.frombuffer(samples, dtype=np.int16).astype(np.float32) / 32768.0
     stream = recognizer.create_stream()
     stream.accept_waveform(sample_rate, samples)
     tail = np.zeros(int(sample_rate * 0.5), dtype=np.float32)
     stream.accept_waveform(sample_rate, tail)
     stream.input_finished()
-
     while recognizer.is_ready(stream):
         recognizer.decode_stream(stream)
-
     os.unlink(wav_path)
     return recognizer.get_result(stream).strip()
 
 
 def synthesize(text: str) -> str:
-    """Convert text to speech via Piper, return path to wav file."""
     voice = get_voice()
     out_path = tempfile.mktemp(suffix='.wav')
     with wave.open(out_path, 'wb') as wf:
         voice.synthesize_wav(text, wf)
-    # Convert to ogg for Telegram voice note
     ogg_path = out_path.replace('.wav', '.ogg')
     subprocess.run(
         ['ffmpeg', '-y', '-i', out_path, '-c:a', 'libopus', '-b:a', '64k', ogg_path],
@@ -105,21 +141,27 @@ def synthesize(text: str) -> str:
     return ogg_path
 
 
-def ask_openclaude(text: str) -> str:
-    """Send text to OpenClaude and get response."""
-    env = {**os.environ}
-    # Load openclaude env vars
-    env_file = Path.home() / '.config' / 'openclaude-rig' / 'env'
-    for line in env_file.read_text().splitlines():
-        if '=' in line and not line.startswith('#'):
-            k, v = line.split('=', 1)
-            env[k.strip()] = v.strip()
+_oc_lock = threading.Lock()
 
-    result = subprocess.run(
-        ['openclaude', '--print', '-p', text],
-        capture_output=True, text=True, timeout=120, env=env,
-    )
-    return result.stdout.strip() or result.stderr.strip() or 'No response.'
+
+def ask_openclaude(text: str, user_id: str = '974838875') -> str:
+    """Run OpenClaude locally with DeepSeek, from the user memory dir.
+    Browser MCP config comes from ~/.openclaude.json (managed by ops bot).
+    """
+    if not _oc_lock.acquire(timeout=5):
+        return 'I am still working on the previous request. Please wait a moment.'
+    try:
+        memory_dir = Path.home() / 'memory' / user_id
+        memory_dir.mkdir(parents=True, exist_ok=True)
+        cmd = ['openclaude', '--print', '--continue', '--dangerously-skip-permissions', '-p', text]
+        result = subprocess.run(
+            cmd,
+            capture_output=True, text=True, timeout=180,
+            cwd=str(memory_dir),
+        )
+        return result.stdout.strip() or result.stderr.strip() or 'No response.'
+    finally:
+        _oc_lock.release()
 
 
 async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -128,13 +170,11 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     msg = await update.message.reply_text('🎧 Listening...')
 
-    # Download voice note
     voice_file = await update.message.voice.get_file()
     with tempfile.NamedTemporaryFile(suffix='.ogg', delete=False) as f:
         await voice_file.download_to_drive(f.name)
         ogg_path = f.name
 
-    # STT
     try:
         text = transcribe(ogg_path)
     finally:
@@ -144,17 +184,21 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text('Could not understand the audio.')
         return
 
-    await msg.edit_text(f'🗣 \"{text}\"')
+    await msg.edit_text(f'🗣 "{text}"')
     thinking_msg = await update.message.reply_text('⏳ Thinking...')
 
-    # LLM
-    response = ask_openclaude(text)
+    response = ask_openclaude(text, str(update.effective_user.id))
     await thinking_msg.edit_text(response[:4096])
 
-    # TTS
+    uid = update.effective_user.id
+    _memory_log(uid, "user", text)
+    _memory_log(uid, "assistant", response)
+    if _memory_should_consolidate(uid):
+        threading.Thread(target=_memory_consolidate, args=(uid,), daemon=True).start()
+
     try:
-        if _voice_enabled.get(update.effective_user.id, True):
-            audio_path = synthesize(response[:500])  # cap TTS length
+        if _tts_active(uid):
+            audio_path = synthesize(response[:500])
             await update.message.reply_voice(voice=open(audio_path, 'rb'))
             os.unlink(audio_path)
     except Exception as e:
@@ -171,20 +215,34 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     msg = await update.message.reply_text('⏳ Thinking...')
 
-    response = ask_openclaude(text)
+    response = ask_openclaude(text, str(update.effective_user.id))
     await msg.edit_text(response[:4096])
 
-    # TTS
+    uid = update.effective_user.id
+    _memory_log(uid, "user", text)
+    _memory_log(uid, "assistant", response)
+    if _memory_should_consolidate(uid):
+        threading.Thread(target=_memory_consolidate, args=(uid,), daemon=True).start()
+
     try:
-        audio_path = synthesize(response[:500])
-        await update.message.reply_voice(voice=open(audio_path, 'rb'))
-        os.unlink(audio_path)
+        if _tts_active(uid):
+            audio_path = synthesize(response[:500])
+            await update.message.reply_voice(voice=open(audio_path, 'rb'))
+            os.unlink(audio_path)
     except Exception as e:
         log.warning(f'TTS failed: {e}')
 
 
 # --- per-user state ---
-_voice_enabled = {}  # user_id -> bool, default True
+_voice_enabled = {}
+TTS_FLAG = Path.home() / '.tts_off'
+
+
+def _tts_active(uid):
+    """Check if TTS is on. File flag overrides per-user dict."""
+    if TTS_FLAG.exists():
+        return False
+    return _voice_enabled.get(uid, True)
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -198,7 +256,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         '/model - Show current LLM model\n'
         '/lang - Show STT/TTS language\n'
         '/clear - Clear conversation context\n'
-        '/status - Bot status and memory usage'
+        '/status - Bot status and memory usage\n\n'
+        'For browser: use /browse on the ops bot first.'
     )
 
 
@@ -212,7 +271,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         '/model - Show current LLM model\n'
         '/lang - Show STT/TTS language\n'
         '/clear - Clear conversation context\n'
-        '/status - Bot status and memory usage'
+        '/status - Bot status and memory usage\n\n'
+        'Browser is managed by the ops bot (/browse, /stopbrowser).'
     )
 
 
@@ -241,15 +301,18 @@ async def cmd_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not gate(update.effective_user.id):
         return
     await update.message.reply_text(
-        f'STT: English (sherpa-onnx streaming zipformer)\n'
-        f'TTS: en_GB-cori-medium (Piper)'
+        'STT: English (sherpa-onnx streaming zipformer)\n'
+        'TTS: en_GB-cori-medium (Piper)'
     )
 
 
 async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not gate(update.effective_user.id):
         return
-    await update.message.reply_text('Context cleared. (OpenClaude runs stateless per message — each message is independent.)')
+    uid = update.effective_user.id
+    if _transcripts.get(str(uid)):
+        threading.Thread(target=_memory_consolidate, args=(uid,), daemon=True).start()
+    await update.message.reply_text('Context cleared. Memories saved.')
 
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -260,10 +323,24 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     stt_state = 'loaded' if _recognizer else 'not loaded'
     tts_state = 'loaded' if _voice else 'not loaded'
     mem = subprocess.run(['free', '-h'], capture_output=True, text=True).stdout
+
+    # Check if browser MCP is configured
+    oc_config = Path.home() / '.openclaude.json'
+    browser_status = 'not configured'
+    if oc_config.exists():
+        try:
+            config = json.loads(oc_config.read_text())
+            mcp = config.get('mcpServers', {}).get('playwright', {})
+            if mcp:
+                browser_status = f"configured ({mcp.get('url', '?')})"
+        except Exception:
+            pass
+
     await update.message.reply_text(
         f'Agent bot RSS: {rss} MB\n'
         f'STT: {stt_state}\n'
-        f'TTS: {tts_state}\n\n'
+        f'TTS: {tts_state}\n'
+        f'Browser: {browser_status}\n\n'
         f'{mem}'
     )
 
